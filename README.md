@@ -1738,14 +1738,14 @@ The circuit breaker prevents hammering a failing Neo4j instance. It has three st
 stateDiagram-v2
     [*] --> CLOSED
 
-    CLOSED --> CLOSED: Success<br/>(reset failure count)
-    CLOSED --> OPEN: Failure count >= threshold<br/>(default: 5)
+    CLOSED --> CLOSED : Success — reset failure count
+    CLOSED --> OPEN : Failure count >= threshold (default 5)
 
-    OPEN --> OPEN: Call rejected immediately<br/>(raises CircuitBreakerOpen)
-    OPEN --> HALF_OPEN: After recovery_timeout<br/>(default: 30s)
+    OPEN --> OPEN : Call rejected — raises CircuitBreakerOpen
+    OPEN --> HALF_OPEN : After recovery_timeout (default 30s)
 
-    HALF_OPEN --> CLOSED: Test call succeeds<br/>(reset all counters)
-    HALF_OPEN --> OPEN: Test call fails<br/>(restart timeout)
+    HALF_OPEN --> CLOSED : Test call succeeds — reset all counters
+    HALF_OPEN --> OPEN : Test call fails — restart timeout
 ```
 
 **States explained:**
