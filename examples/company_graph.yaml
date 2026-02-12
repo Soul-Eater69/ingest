@@ -1,0 +1,49 @@
+# Example: Build a company knowledge graph from CSV files.
+#
+# This config reads employees and departments from CSV, then creates
+# Person and Department nodes and WORKS_IN relationships.
+
+neo4j:
+  uri: bolt://localhost:7687
+  username: neo4j
+  password: changeme
+  database: neo4j
+
+sources:
+  - name: employees
+    type: csv
+    path: examples/data/employees.csv
+
+  - name: departments
+    type: csv
+    path: examples/data/departments.csv
+
+nodes:
+  - source: employees
+    label: Person
+    key: emp_id
+    properties:
+      - source_field: emp_id
+        target: emp_id
+      - source_field: name
+      - source_field: email
+      - source_field: title
+
+  - source: departments
+    label: Department
+    key: dept_id
+    properties:
+      - source_field: dept_id
+        target: dept_id
+      - source_field: dept_name
+        target: name
+
+relationships:
+  - source: employees
+    rel_type: WORKS_IN
+    from_label: Person
+    from_key: emp_id
+    from_field: emp_id
+    to_label: Department
+    to_key: dept_id
+    to_field: dept_id

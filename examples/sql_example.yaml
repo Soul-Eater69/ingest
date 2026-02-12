@@ -1,0 +1,48 @@
+# Example: Ingest data from a SQL database into Neo4j.
+#
+# Uses SQLAlchemy, so any supported database works:
+# PostgreSQL, MySQL, SQLite, etc.
+
+neo4j:
+  uri: bolt://localhost:7687
+  username: neo4j
+  password: changeme
+
+sources:
+  - name: customers
+    type: sql
+    connection_string: sqlite:///examples/data/shop.db
+    query: "SELECT id, name, email, city FROM customers"
+
+  - name: orders
+    type: sql
+    connection_string: sqlite:///examples/data/shop.db
+    query: "SELECT order_id, customer_id, product, amount FROM orders"
+
+nodes:
+  - source: customers
+    label: Customer
+    key: id
+    properties:
+      - source_field: id
+      - source_field: name
+      - source_field: email
+      - source_field: city
+
+  - source: orders
+    label: Order
+    key: order_id
+    properties:
+      - source_field: order_id
+      - source_field: product
+      - source_field: amount
+
+relationships:
+  - source: orders
+    rel_type: PLACED
+    from_label: Customer
+    from_key: id
+    from_field: customer_id
+    to_label: Order
+    to_key: order_id
+    to_field: order_id

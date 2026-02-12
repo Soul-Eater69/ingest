@@ -1,0 +1,6 @@
+emp_id,name,email,title,dept_id
+1,Alice Johnson,alice@example.com,Software Engineer,10
+2,Bob Smith,bob@example.com,Product Manager,20
+3,Carol White,carol@example.com,Data Scientist,10
+4,Dave Brown,dave@example.com,Designer,30
+5,Eve Davis,eve@example.com,Engineering Manager,10

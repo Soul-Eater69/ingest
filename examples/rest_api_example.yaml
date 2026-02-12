@@ -1,0 +1,46 @@
+# Example: Ingest data from a REST API into Neo4j.
+#
+# This config fetches users and posts from a JSON placeholder API,
+# creates User and Post nodes, and links them with AUTHORED relationships.
+
+neo4j:
+  uri: bolt://localhost:7687
+  username: neo4j
+  password: changeme
+
+sources:
+  - name: users
+    type: rest
+    url: https://jsonplaceholder.typicode.com/users
+
+  - name: posts
+    type: rest
+    url: https://jsonplaceholder.typicode.com/posts
+
+nodes:
+  - source: users
+    label: User
+    key: id
+    properties:
+      - source_field: id
+      - source_field: name
+      - source_field: email
+      - source_field: username
+
+  - source: posts
+    label: Post
+    key: id
+    properties:
+      - source_field: id
+      - source_field: title
+      - source_field: body
+
+relationships:
+  - source: posts
+    rel_type: AUTHORED
+    from_label: User
+    from_key: id
+    from_field: userId
+    to_label: Post
+    to_key: id
+    to_field: id
