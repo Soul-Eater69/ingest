@@ -22,6 +22,9 @@ dev = [
     "pytest>=7.0",
     "pytest-mock>=3.0",
 ]
+spark = [
+    "pyspark>=3.4",
+]
 
 [project.scripts]
 neo4j-ingest = "neo4j_ingest.cli:main"

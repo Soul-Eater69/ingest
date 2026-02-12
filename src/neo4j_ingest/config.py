@@ -197,6 +197,16 @@ class SchemaHook(BaseModel):
 # Job-level settings
 # ---------------------------------------------------------------------------
 
+class SparkSettings(BaseModel):
+    """Spark execution settings (only used when execution_mode is 'spark')."""
+
+    app_name: str = "neo4j-ingest"
+    master: str | None = None  # None = use existing SparkSession or default
+    partitions: int | None = None
+    spark_config: dict[str, str] = Field(default_factory=dict)
+    neo4j_connector_batch_size: int = 5000
+
+
 class JobSettings(BaseModel):
     """Global job-level configuration."""
 
@@ -208,6 +218,8 @@ class JobSettings(BaseModel):
     retry_base_delay: float = 1.0
     continue_on_source_error: bool = False
     metrics_output: str | None = None  # Path to write JSON metrics
+    execution_mode: Literal["standard", "spark"] = "standard"
+    spark: SparkSettings = Field(default_factory=SparkSettings)
 
 
 # ---------------------------------------------------------------------------

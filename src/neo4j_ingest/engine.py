@@ -3,6 +3,12 @@
 Reads the config, fetches data from each source, validates records,
 applies transforms, and writes nodes and relationships to Neo4j.
 
+Supports two execution modes:
+- **standard**: Python-native. Reads into memory, writes via Neo4j driver.
+  Suitable for up to ~10M records on a single machine.
+- **spark**: Distributed. Reads via Spark, writes via Neo4j Spark Connector.
+  Scales to billions of records across a cluster.
+
 Features:
 - Pre/post schema hooks (create indexes/constraints)
 - Neo4j health check before starting
@@ -82,45 +88,146 @@ def _read_source_safe(source_cfg: Any) -> tuple[str, list[Record] | Exception]:
         return source_cfg.name, exc
 
 
-def run(
+# ---------------------------------------------------------------------------
+# Spark helpers
+# ---------------------------------------------------------------------------
+
+def _init_spark_session(config: IngestConfig) -> Any:
+    """Create or retrieve a SparkSession with the configured settings."""
+    from pyspark.sql import SparkSession
+
+    spark_cfg = config.settings.spark
+    builder = SparkSession.builder.appName(spark_cfg.app_name)
+
+    if spark_cfg.master:
+        builder = builder.master(spark_cfg.master)
+
+    for k, v in spark_cfg.spark_config.items():
+        builder = builder.config(k, v)
+
+    return builder.getOrCreate()
+
+
+def _run_spark(
     config: IngestConfig,
-    dry_run: bool = False,
+    dry_run: bool,
+    job_metrics: JobMetrics,
+    result: IngestResult,
 ) -> IngestResult:
-    """Execute the full ingestion pipeline.
+    """Execute the ingestion pipeline using Spark + Neo4j Spark Connector."""
+    from neo4j_ingest.spark_writer import SparkNeo4jWriter
 
-    Steps:
-        1. Health check Neo4j (unless disabled or dry_run)
-        2. Read data from all sources (optionally in parallel)
-        3. Run pre-hooks (indexes, constraints)
-        4. For each node mapping: validate, then write nodes
-        5. For each relationship mapping: validate, then write rels
-        6. Run post-hooks
-        7. Emit metrics
-    """
+    # Ensure spark source types are registered
+    import neo4j_ingest.spark_sources  # noqa: F401
+
     settings = config.settings
-    result = IngestResult()
+    spark = _init_spark_session(config)
+    logger.info("Spark session initialised: %s", spark.sparkContext.appName)
 
-    # Metrics
-    job_metrics = JobMetrics(
-        job_id=uuid.uuid4().hex[:12],
-        start_time=time.time(),
-    )
-    result.metrics = job_metrics
+    # Read all sources (via the standard dispatcher which now includes spark_* types)
+    source_data: dict[str, list[Record]] = {}
+    for source_cfg in config.sources:
+        step = job_metrics.add_step(f"source:{source_cfg.name}")
+        with track_step(step):
+            try:
+                records = read_source(source_cfg)
+                source_data[source_cfg.name] = records
+                step.records_processed = len(records)
+            except Exception:
+                if not settings.continue_on_source_error:
+                    raise
+                logger.error("Source '%s' failed, continuing", source_cfg.name)
 
-    # Step 1: Health check
-    if settings.health_check and not dry_run:
-        if not check_neo4j_health(
-            config.neo4j.uri,
-            config.neo4j.username,
-            config.neo4j.password,
-            config.neo4j.database,
-        ):
-            raise ConnectionError(
-                f"Neo4j health check failed for {config.neo4j.uri}. "
-                "Set settings.health_check: false to skip."
-            )
+    if dry_run:
+        logger.info("Dry run (Spark mode): skipping Neo4j writes")
+        for name, records in source_data.items():
+            logger.info("  Source '%s': %d records", name, len(records))
+        job_metrics.status = "dry_run"
+        job_metrics.end_time = time.time()
+        job_metrics.log_summary()
+        return result
 
-    # Step 2: Read all sources
+    spark_settings = settings.spark
+    with SparkNeo4jWriter(
+        config.neo4j,
+        batch_size=spark_settings.neo4j_connector_batch_size,
+        partitions=spark_settings.partitions,
+    ) as writer:
+        # Pre-hooks
+        if config.pre_hooks:
+            hook_step = job_metrics.add_step("pre_hooks")
+            with track_step(hook_step):
+                writer.run_hooks(config.pre_hooks)
+                hook_step.records_processed = len(config.pre_hooks)
+
+        # Nodes
+        for node_mapping in config.nodes:
+            step = job_metrics.add_step(f"nodes:{node_mapping.label}")
+            with track_step(step):
+                records = source_data.get(node_mapping.source, [])
+
+                validator = _build_validator(node_mapping.validation)
+                if validator:
+                    vresult = validator.validate(records)
+                    records = vresult.valid_records
+                    step.records_failed = vresult.total_errors
+                    result.records_skipped += vresult.total_errors
+
+                count = writer.write_nodes(
+                    records, node_mapping,
+                    batch_size=spark_settings.neo4j_connector_batch_size,
+                )
+                step.records_processed = count
+                result.nodes_created[node_mapping.label] = (
+                    result.nodes_created.get(node_mapping.label, 0) + count
+                )
+
+        # Relationships
+        for rel_mapping in config.relationships:
+            step = job_metrics.add_step(f"rels:{rel_mapping.rel_type}")
+            with track_step(step):
+                records = source_data.get(rel_mapping.source, [])
+
+                validator = _build_validator(rel_mapping.validation)
+                if validator:
+                    vresult = validator.validate(records)
+                    records = vresult.valid_records
+                    step.records_failed = vresult.total_errors
+                    result.records_skipped += vresult.total_errors
+
+                count = writer.write_relationships(
+                    records, rel_mapping,
+                    batch_size=spark_settings.neo4j_connector_batch_size,
+                )
+                step.records_processed = count
+                result.relationships_created[rel_mapping.rel_type] = (
+                    result.relationships_created.get(rel_mapping.rel_type, 0) + count
+                )
+
+        # Post-hooks
+        if config.post_hooks:
+            hook_step = job_metrics.add_step("post_hooks")
+            with track_step(hook_step):
+                writer.run_hooks(config.post_hooks)
+                hook_step.records_processed = len(config.post_hooks)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Standard (Python-native) pipeline
+# ---------------------------------------------------------------------------
+
+def _run_standard(
+    config: IngestConfig,
+    dry_run: bool,
+    job_metrics: JobMetrics,
+    result: IngestResult,
+) -> IngestResult:
+    """Execute the pipeline using the Python Neo4j driver."""
+    settings = config.settings
+
+    # Read all sources
     source_data: dict[str, list[Record]] = {}
 
     if settings.parallel_sources and len(config.sources) > 1:
@@ -169,7 +276,6 @@ def run(
         job_metrics.log_summary()
         return result
 
-    # Step 3–6: Write to Neo4j
     with Neo4jWriter(
         config.neo4j,
         retry_max_attempts=settings.retry_max_attempts,
@@ -188,7 +294,6 @@ def run(
             with track_step(step):
                 records = source_data.get(node_mapping.source, [])
 
-                # Validate
                 validator = _build_validator(node_mapping.validation)
                 if validator:
                     vresult = validator.validate(records)
@@ -232,8 +337,65 @@ def run(
                 writer.run_hooks(config.post_hooks)
                 hook_step.records_processed = len(config.post_hooks)
 
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Main entry points
+# ---------------------------------------------------------------------------
+
+def run(
+    config: IngestConfig,
+    dry_run: bool = False,
+) -> IngestResult:
+    """Execute the full ingestion pipeline.
+
+    Automatically selects execution mode based on ``settings.execution_mode``:
+    - ``"standard"``: Python-native reads + Neo4j Python driver writes
+    - ``"spark"``: Spark distributed reads + Neo4j Spark Connector writes
+
+    Steps:
+        1. Health check Neo4j (unless disabled or dry_run)
+        2. Read data from all sources
+        3. Run pre-hooks (indexes, constraints)
+        4. For each node mapping: validate, then write nodes
+        5. For each relationship mapping: validate, then write rels
+        6. Run post-hooks
+        7. Emit metrics
+    """
+    settings = config.settings
+    result = IngestResult()
+
+    # Metrics
+    job_metrics = JobMetrics(
+        job_id=uuid.uuid4().hex[:12],
+        start_time=time.time(),
+    )
+    result.metrics = job_metrics
+
+    # Health check
+    if settings.health_check and not dry_run:
+        if not check_neo4j_health(
+            config.neo4j.uri,
+            config.neo4j.username,
+            config.neo4j.password,
+            config.neo4j.database,
+        ):
+            raise ConnectionError(
+                f"Neo4j health check failed for {config.neo4j.uri}. "
+                "Set settings.health_check: false to skip."
+            )
+
+    # Dispatch to execution mode
+    if settings.execution_mode == "spark":
+        logger.info("Using Spark execution mode")
+        _run_spark(config, dry_run, job_metrics, result)
+    else:
+        _run_standard(config, dry_run, job_metrics, result)
+
     # Finalise metrics
-    job_metrics.status = "completed"
+    if job_metrics.status == "pending":
+        job_metrics.status = "completed"
     job_metrics.end_time = time.time()
     job_metrics.log_summary()
 

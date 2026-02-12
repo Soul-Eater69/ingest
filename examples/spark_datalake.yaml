@@ -1,0 +1,166 @@
+# Spark + Databricks Example: Ingest a massive data lake into Neo4j.
+#
+# This config demonstrates the Spark execution mode for handling
+# datasets that are too large for single-machine memory.
+#
+# Architecture:
+#   [S3/ADLS Data Lake] --> [Spark Cluster] --> [Neo4j Cluster]
+#
+# Prerequisites:
+#   pip install neo4j-ingest[spark]
+#   Spark session with Neo4j Spark Connector on classpath:
+#     spark.jars.packages=org.neo4j:neo4j-connector-apache-spark_2.12:5.3.1_for_spark_3
+
+neo4j:
+  uri: ${NEO4J_URI:-bolt://localhost:7687}
+  username: ${NEO4J_USER:-neo4j}
+  password: ${NEO4J_PASSWORD}
+  database: ${NEO4J_DATABASE:-neo4j}
+  max_connection_pool_size: 200
+  encrypted: true
+
+settings:
+  execution_mode: spark
+  health_check: true
+  metrics_output: /tmp/spark_ingest_metrics.json
+  spark:
+    app_name: neo4j-datalake-ingest
+    # master: spark://spark-master:7077  # Omit for Databricks (auto-managed)
+    partitions: 64
+    neo4j_connector_batch_size: 10000
+    spark_config:
+      spark.sql.shuffle.partitions: "200"
+      spark.sql.adaptive.enabled: "true"
+      spark.neo4j.url: ${NEO4J_URI:-bolt://localhost:7687}
+      spark.neo4j.authentication.basic.username: ${NEO4J_USER:-neo4j}
+      spark.neo4j.authentication.basic.password: ${NEO4J_PASSWORD}
+
+pre_hooks:
+  - cypher: "CREATE CONSTRAINT customer_id IF NOT EXISTS FOR (c:Customer) REQUIRE c.customer_id IS UNIQUE"
+    description: "Unique constraint on Customer.customer_id"
+  - cypher: "CREATE CONSTRAINT product_sku IF NOT EXISTS FOR (p:Product) REQUIRE p.sku IS UNIQUE"
+    description: "Unique constraint on Product.sku"
+  - cypher: "CREATE INDEX customer_email IF NOT EXISTS FOR (c:Customer) ON (c.email)"
+    description: "Index on Customer.email"
+
+sources:
+  # Read millions of customer records from Parquet in S3
+  - name: customers
+    type: spark_parquet
+    path: s3a://data-lake/warehouse/customers/
+
+  # Read product catalog from Delta Lake
+  - name: products
+    type: spark_delta
+    path: s3a://data-lake/delta/products/
+
+  # Read order events from a Databricks Unity Catalog table
+  - name: orders
+    type: spark_table
+    query: catalog.sales.orders
+
+  # Can also read from a JDBC source via Spark (parallel partitioned reads)
+  - name: reviews
+    type: spark_jdbc
+    connection_string: "jdbc:postgresql://db.prod:5432/reviews"
+    query: "SELECT * FROM product_reviews WHERE created_at > '2024-01-01'"
+    headers:
+      driver: org.postgresql.Driver
+      numPartitions: "16"
+      partitionColumn: id
+      lowerBound: "1"
+      upperBound: "10000000"
+      fetchsize: "10000"
+
+nodes:
+  - source: customers
+    label: Customer
+    key: customer_id
+    properties:
+      - source_field: customer_id
+      - source_field: email
+        transform:
+          type: lowercase
+      - source_field: full_name
+        target: name
+        transform:
+          type: strip
+      - source_field: signup_date
+        target: signup_date
+        transform:
+          type: to_datetime
+          params:
+            format: "%Y-%m-%d"
+    validation:
+      on_error: skip
+      rules:
+        - field: customer_id
+          rule: required
+        - field: email
+          rule: regex
+          params:
+            pattern: "^[^@]+@[^@]+\\.[^@]+$"
+
+  - source: products
+    label: Product
+    key: sku
+    properties:
+      - source_field: sku
+      - source_field: product_name
+        target: name
+      - source_field: price
+        transform:
+          type: to_float
+      - source_field: category
+
+  - source: reviews
+    label: Review
+    key: review_id
+    properties:
+      - source_field: review_id
+      - source_field: rating
+        transform:
+          type: to_int
+      - source_field: body
+        target: text
+
+relationships:
+  - source: orders
+    rel_type: PURCHASED
+    from_label: Customer
+    from_key: customer_id
+    from_field: customer_id
+    to_label: Product
+    to_key: sku
+    to_field: product_sku
+    properties:
+      - source_field: order_date
+        target: date
+        transform:
+          type: to_datetime
+          params:
+            format: "%Y-%m-%d"
+      - source_field: quantity
+        transform:
+          type: to_int
+
+  - source: reviews
+    rel_type: REVIEWED
+    from_label: Customer
+    from_key: customer_id
+    from_field: customer_id
+    to_label: Product
+    to_key: sku
+    to_field: product_sku
+
+post_hooks:
+  - cypher: >-
+      MATCH (p:Product)<-[r:PURCHASED]-()
+      WITH p, count(r) AS sales
+      SET p.total_sales = sales
+    description: "Compute total sales per product"
+  - cypher: >-
+      MATCH (p:Product)<-[r:REVIEWED]-()
+      WITH p, avg(r.rating) AS avg_rating
+      SET p.avg_rating = avg_rating
+    description: "Compute average rating per product"
