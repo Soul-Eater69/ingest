@@ -1,18 +1,38 @@
-"""Ingestion engine — the orchestrator.
+"""Ingestion engine — the enterprise orchestrator.
 
-Reads the config, fetches data from each source, and writes nodes and
-relationships to Neo4j according to the mappings.
+Reads the config, fetches data from each source, validates records,
+applies transforms, and writes nodes and relationships to Neo4j.
+
+Features:
+- Pre/post schema hooks (create indexes/constraints)
+- Neo4j health check before starting
+- Parallel source reading (optional)
+- Record-level validation with configurable error strategies
+- Structured metrics with JSON output
+- Retry on transient Neo4j failures
+- Dry-run mode (validate config + read sources without writing)
 """
 
 from __future__ import annotations
 
 import logging
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from neo4j_ingest.config import IngestConfig, load_config
+from neo4j_ingest.config import IngestConfig, ValidationConfig, load_config
 from neo4j_ingest.graph import Neo4jWriter
+from neo4j_ingest.metrics import JobMetrics, track_step
+from neo4j_ingest.resilience import check_neo4j_health
 from neo4j_ingest.sources import read_source
+from neo4j_ingest.validation import (
+    ErrorStrategy,
+    RecordValidator,
+    ValidationRule,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +45,8 @@ class IngestResult:
 
     nodes_created: dict[str, int] = field(default_factory=dict)
     relationships_created: dict[str, int] = field(default_factory=dict)
+    records_skipped: int = 0
+    metrics: JobMetrics | None = None
 
     @property
     def total_nodes(self) -> int:
@@ -35,49 +57,202 @@ class IngestResult:
         return sum(self.relationships_created.values())
 
 
-def run(config: IngestConfig, batch_size: int = 500) -> IngestResult:
+def _build_validator(vcfg: ValidationConfig | None) -> RecordValidator | None:
+    """Build a RecordValidator from a config validation block."""
+    if vcfg is None or not vcfg.rules:
+        return None
+    rules = [
+        ValidationRule(
+            field=r.field,
+            rule=r.rule,
+            params=r.params,
+            message=r.message,
+        )
+        for r in vcfg.rules
+    ]
+    return RecordValidator(rules=rules, strategy=ErrorStrategy(vcfg.on_error))
+
+
+def _read_source_safe(source_cfg: Any) -> tuple[str, list[Record] | Exception]:
+    """Read a single source, returning (name, records) or (name, exception)."""
+    try:
+        records = read_source(source_cfg)
+        return source_cfg.name, records
+    except Exception as exc:
+        return source_cfg.name, exc
+
+
+def run(
+    config: IngestConfig,
+    dry_run: bool = False,
+) -> IngestResult:
     """Execute the full ingestion pipeline.
 
-    1. Read data from every declared source.
-    2. For each node mapping, create/merge nodes.
-    3. For each relationship mapping, create/merge relationships.
+    Steps:
+        1. Health check Neo4j (unless disabled or dry_run)
+        2. Read data from all sources (optionally in parallel)
+        3. Run pre-hooks (indexes, constraints)
+        4. For each node mapping: validate, then write nodes
+        5. For each relationship mapping: validate, then write rels
+        6. Run post-hooks
+        7. Emit metrics
     """
+    settings = config.settings
     result = IngestResult()
 
-    # Step 1 — read all sources into memory keyed by name
-    source_data: dict[str, list[Record]] = {}
-    for source_cfg in config.sources:
-        source_data[source_cfg.name] = read_source(source_cfg)
-
-    # Step 2 & 3 — write to Neo4j
-    with Neo4jWriter(config.neo4j) as writer:
-        # Nodes first (relationships depend on nodes existing)
-        for node_mapping in config.nodes:
-            records = source_data[node_mapping.source]
-            count = writer.write_nodes(records, node_mapping, batch_size=batch_size)
-            result.nodes_created[node_mapping.label] = (
-                result.nodes_created.get(node_mapping.label, 0) + count
-            )
-
-        # Then relationships
-        for rel_mapping in config.relationships:
-            records = source_data[rel_mapping.source]
-            count = writer.write_relationships(
-                records, rel_mapping, batch_size=batch_size
-            )
-            result.relationships_created[rel_mapping.rel_type] = (
-                result.relationships_created.get(rel_mapping.rel_type, 0) + count
-            )
-
-    logger.info(
-        "Ingestion complete: %d nodes, %d relationships",
-        result.total_nodes,
-        result.total_relationships,
+    # Metrics
+    job_metrics = JobMetrics(
+        job_id=uuid.uuid4().hex[:12],
+        start_time=time.time(),
     )
+    result.metrics = job_metrics
+
+    # Step 1: Health check
+    if settings.health_check and not dry_run:
+        if not check_neo4j_health(
+            config.neo4j.uri,
+            config.neo4j.username,
+            config.neo4j.password,
+            config.neo4j.database,
+        ):
+            raise ConnectionError(
+                f"Neo4j health check failed for {config.neo4j.uri}. "
+                "Set settings.health_check: false to skip."
+            )
+
+    # Step 2: Read all sources
+    source_data: dict[str, list[Record]] = {}
+
+    if settings.parallel_sources and len(config.sources) > 1:
+        logger.info(
+            "Reading %d sources in parallel (max_workers=%d)",
+            len(config.sources),
+            settings.max_workers,
+        )
+        with ThreadPoolExecutor(max_workers=settings.max_workers) as pool:
+            futures = {
+                pool.submit(_read_source_safe, src): src
+                for src in config.sources
+            }
+            for future in as_completed(futures):
+                name, data = future.result()
+                step = job_metrics.add_step(f"source:{name}")
+                if isinstance(data, Exception):
+                    step.status = "failed"
+                    step.error = str(data)
+                    if not settings.continue_on_source_error:
+                        raise data
+                    logger.error("Source '%s' failed: %s", name, data)
+                else:
+                    source_data[name] = data
+                    step.records_processed = len(data)
+                    step.status = "completed"
+    else:
+        for source_cfg in config.sources:
+            step = job_metrics.add_step(f"source:{source_cfg.name}")
+            with track_step(step):
+                try:
+                    records = read_source(source_cfg)
+                    source_data[source_cfg.name] = records
+                    step.records_processed = len(records)
+                except Exception:
+                    if not settings.continue_on_source_error:
+                        raise
+                    logger.error("Source '%s' failed, continuing", source_cfg.name)
+
+    if dry_run:
+        logger.info("Dry run: skipping Neo4j writes")
+        for name, records in source_data.items():
+            logger.info("  Source '%s': %d records", name, len(records))
+        job_metrics.status = "dry_run"
+        job_metrics.end_time = time.time()
+        job_metrics.log_summary()
+        return result
+
+    # Step 3–6: Write to Neo4j
+    with Neo4jWriter(
+        config.neo4j,
+        retry_max_attempts=settings.retry_max_attempts,
+        retry_base_delay=settings.retry_base_delay,
+    ) as writer:
+        # Pre-hooks
+        if config.pre_hooks:
+            hook_step = job_metrics.add_step("pre_hooks")
+            with track_step(hook_step):
+                writer.run_hooks(config.pre_hooks)
+                hook_step.records_processed = len(config.pre_hooks)
+
+        # Nodes
+        for node_mapping in config.nodes:
+            step = job_metrics.add_step(f"nodes:{node_mapping.label}")
+            with track_step(step):
+                records = source_data.get(node_mapping.source, [])
+
+                # Validate
+                validator = _build_validator(node_mapping.validation)
+                if validator:
+                    vresult = validator.validate(records)
+                    records = vresult.valid_records
+                    step.records_failed = vresult.total_errors
+                    result.records_skipped += vresult.total_errors
+
+                count = writer.write_nodes(
+                    records, node_mapping, batch_size=settings.batch_size
+                )
+                step.records_processed = count
+                result.nodes_created[node_mapping.label] = (
+                    result.nodes_created.get(node_mapping.label, 0) + count
+                )
+
+        # Relationships
+        for rel_mapping in config.relationships:
+            step = job_metrics.add_step(f"rels:{rel_mapping.rel_type}")
+            with track_step(step):
+                records = source_data.get(rel_mapping.source, [])
+
+                validator = _build_validator(rel_mapping.validation)
+                if validator:
+                    vresult = validator.validate(records)
+                    records = vresult.valid_records
+                    step.records_failed = vresult.total_errors
+                    result.records_skipped += vresult.total_errors
+
+                count = writer.write_relationships(
+                    records, rel_mapping, batch_size=settings.batch_size
+                )
+                step.records_processed = count
+                result.relationships_created[rel_mapping.rel_type] = (
+                    result.relationships_created.get(rel_mapping.rel_type, 0) + count
+                )
+
+        # Post-hooks
+        if config.post_hooks:
+            hook_step = job_metrics.add_step("post_hooks")
+            with track_step(hook_step):
+                writer.run_hooks(config.post_hooks)
+                hook_step.records_processed = len(config.post_hooks)
+
+    # Finalise metrics
+    job_metrics.status = "completed"
+    job_metrics.end_time = time.time()
+    job_metrics.log_summary()
+
+    if settings.metrics_output:
+        Path(settings.metrics_output).write_text(job_metrics.to_json())
+        logger.info("Metrics written to %s", settings.metrics_output)
+
     return result
 
 
-def run_from_file(config_path: str, batch_size: int = 500) -> IngestResult:
+def run_from_file(
+    config_path: str,
+    dry_run: bool = False,
+) -> IngestResult:
     """Load a config file and run the ingestion pipeline."""
     config = load_config(config_path)
-    return run(config, batch_size=batch_size)
+    return run(config, dry_run=dry_run)
+
+
+def validate_config(config_path: str) -> IngestConfig:
+    """Load and validate a config file without running the pipeline."""
+    return load_config(config_path)

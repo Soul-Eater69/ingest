@@ -1,0 +1,110 @@
+# Enterprise Example: Full-featured ingestion config.
+#
+# Demonstrates all enterprise features:
+# - Environment variable substitution for secrets
+# - Schema hooks (indexes + constraints)
+# - Per-field transforms (type casting, string ops)
+# - Record-level validation with error strategies
+# - Job settings (batch size, retry, parallel reads, metrics)
+
+neo4j:
+  uri: ${NEO4J_URI:-bolt://localhost:7687}
+  username: ${NEO4J_USER:-neo4j}
+  password: ${NEO4J_PASSWORD:-changeme}
+  database: ${NEO4J_DATABASE:-neo4j}
+  max_connection_pool_size: 50
+  encrypted: false
+
+settings:
+  batch_size: 1000
+  parallel_sources: true
+  max_workers: 4
+  health_check: true
+  retry_max_attempts: 5
+  retry_base_delay: 2.0
+  continue_on_source_error: false
+  metrics_output: /tmp/ingest_metrics.json
+
+# Run before ingestion: create indexes and constraints
+pre_hooks:
+  - cypher: "CREATE CONSTRAINT person_id IF NOT EXISTS FOR (p:Person) REQUIRE p.emp_id IS UNIQUE"
+    description: "Unique constraint on Person.emp_id"
+  - cypher: "CREATE CONSTRAINT dept_id IF NOT EXISTS FOR (d:Department) REQUIRE d.dept_id IS UNIQUE"
+    description: "Unique constraint on Department.dept_id"
+  - cypher: "CREATE INDEX person_email IF NOT EXISTS FOR (p:Person) ON (p.email)"
+    description: "Index on Person.email"
+
+# Run after ingestion: analytics or cleanup
+post_hooks:
+  - cypher: "MATCH (d:Department) SET d.employee_count = size([(p)-[:WORKS_IN]->(d) | p])"
+    description: "Compute employee count per department"
+
+sources:
+  - name: employees
+    type: csv
+    path: examples/data/employees.csv
+    encoding: utf-8
+    delimiter: ","
+
+  - name: departments
+    type: csv
+    path: examples/data/departments.csv
+
+nodes:
+  - source: employees
+    label: Person
+    key: emp_id
+    properties:
+      - source_field: emp_id
+        target: emp_id
+        transform:
+          type: to_int
+      - source_field: name
+        transform:
+          type: strip
+      - source_field: email
+        transform:
+          type: lowercase
+      - source_field: title
+        transform:
+          type: strip
+    validation:
+      on_error: skip
+      rules:
+        - field: emp_id
+          rule: required
+        - field: email
+          rule: regex
+          params:
+            pattern: "^[^@]+@[^@]+\\.[^@]+$"
+          message: "Invalid email format"
+
+  - source: departments
+    label: Department
+    key: dept_id
+    properties:
+      - source_field: dept_id
+        target: dept_id
+        transform:
+          type: to_int
+      - source_field: dept_name
+        target: name
+        transform:
+          type: strip
+    validation:
+      on_error: fail
+      rules:
+        - field: dept_id
+          rule: required
+        - field: dept_name
+          rule: required
+
+relationships:
+  - source: employees
+    rel_type: WORKS_IN
+    from_label: Person
+    from_key: emp_id
+    from_field: emp_id
+    to_label: Department
+    to_key: dept_id
+    to_field: dept_id

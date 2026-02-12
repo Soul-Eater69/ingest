@@ -1,7 +1,7 @@
 """Tests for config loading and validation."""
 
 import json
-import textwrap
+import os
 
 import pytest
 import yaml
@@ -92,6 +92,64 @@ class TestIngestConfig:
         assert cfg.neo4j.uri == "bolt://db:7687"
         assert cfg.neo4j.database == "mydb"
 
+    def test_settings_defaults(self):
+        cfg = IngestConfig.model_validate(_minimal_config())
+        assert cfg.settings.batch_size == 500
+        assert cfg.settings.health_check is True
+        assert cfg.settings.retry_max_attempts == 3
+
+    def test_custom_settings(self):
+        data = _minimal_config(settings={"batch_size": 2000, "parallel_sources": True})
+        cfg = IngestConfig.model_validate(data)
+        assert cfg.settings.batch_size == 2000
+        assert cfg.settings.parallel_sources is True
+
+    def test_pre_post_hooks(self):
+        data = _minimal_config(
+            pre_hooks=[{"cypher": "CREATE INDEX IF NOT EXISTS FOR (n:X) ON (n.id)"}],
+            post_hooks=[{"cypher": "MATCH (n) RETURN count(n)", "description": "count"}],
+        )
+        cfg = IngestConfig.model_validate(data)
+        assert len(cfg.pre_hooks) == 1
+        assert len(cfg.post_hooks) == 1
+        assert cfg.post_hooks[0].description == "count"
+
+    def test_property_with_transform(self):
+        data = _minimal_config()
+        data["nodes"][0]["properties"][0]["transform"] = {"type": "to_int"}
+        cfg = IngestConfig.model_validate(data)
+        prop = cfg.nodes[0].properties[0]
+        assert prop.transform is not None
+
+    def test_property_with_transform_chain(self):
+        data = _minimal_config()
+        data["nodes"][0]["properties"][0]["transform"] = [
+            {"type": "strip"},
+            {"type": "to_int"},
+        ]
+        cfg = IngestConfig.model_validate(data)
+        prop = cfg.nodes[0].properties[0]
+        assert isinstance(prop.transform, list)
+        assert len(prop.transform) == 2
+
+    def test_validation_config(self):
+        data = _minimal_config()
+        data["nodes"][0]["validation"] = {
+            "on_error": "skip",
+            "rules": [{"field": "id", "rule": "required"}],
+        }
+        cfg = IngestConfig.model_validate(data)
+        assert cfg.nodes[0].validation is not None
+        assert cfg.nodes[0].validation.on_error == "skip"
+        assert len(cfg.nodes[0].validation.rules) == 1
+
+    def test_allows_custom_source_type(self):
+        """Plugin source types should not be rejected by validation."""
+        data = _minimal_config()
+        data["sources"] = [{"name": "s1", "type": "kafka"}]
+        cfg = IngestConfig.model_validate(data)
+        assert cfg.sources[0].type == "kafka"
+
 
 class TestLoadConfig:
     def test_load_yaml(self, tmp_path):
@@ -104,3 +162,17 @@ class TestLoadConfig:
         p.write_text(json.dumps(_minimal_config()))
         cfg = load_config(p)
         assert cfg.sources[0].name == "s1"
+
+    def test_env_var_substitution(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TEST_NEO4J_URI", "bolt://prod:7687")
+        data = _minimal_config(neo4j={"uri": "${TEST_NEO4J_URI}"})
+        p = _write_yaml(tmp_path, data)
+        cfg = load_config(p)
+        assert cfg.neo4j.uri == "bolt://prod:7687"
+
+    def test_env_var_default(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("UNDEFINED_VAR", raising=False)
+        data = _minimal_config(neo4j={"password": "${UNDEFINED_VAR:-default_pw}"})
+        p = _write_yaml(tmp_path, data)
+        cfg = load_config(p)
+        assert cfg.neo4j.password == "default_pw"
