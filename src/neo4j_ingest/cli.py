@@ -37,14 +37,35 @@ def main() -> None:
     show_default=True,
 )
 @click.option("--metrics-output", default=None, help="Path to write JSON metrics.")
-def run(config: str, log_level: str, metrics_output: str | None) -> None:
+@click.option(
+    "--mapping-csv",
+    default=None,
+    type=click.Path(exists=True),
+    help="CSV mapping file to overlay onto the YAML config.",
+)
+def run(config: str, log_level: str, metrics_output: str | None, mapping_csv: str | None) -> None:
     """Run the full ingestion pipeline."""
     _setup_logging(log_level)
 
     from neo4j_ingest.engine import run_from_file
 
     try:
-        result = run_from_file(config)
+        if mapping_csv:
+            from neo4j_ingest.config import load_config
+            from neo4j_ingest.csv_mapping import load_csv_mapping
+            from neo4j_ingest.engine import run
+
+            # Load base config for neo4j/settings, overlay CSV mappings
+            base = load_config(config)
+            csv_cfg = load_csv_mapping(
+                mapping_csv,
+                sources=[s.model_dump() for s in base.sources],
+                neo4j=base.neo4j.model_dump(),
+                settings=base.settings.model_dump(),
+            )
+            result = run(csv_cfg)
+        else:
+            result = run_from_file(config)
     except Exception as exc:
         click.echo(f"Error: {exc}", err=True)
         raise SystemExit(1) from exc

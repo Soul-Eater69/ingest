@@ -22,6 +22,7 @@ from neo4j_ingest.config import (
     NodeMapping,
     PropertyMapping,
     RelationshipMapping,
+    SchemaDefinition,
     SchemaHook,
     TransformConfig,
 )
@@ -90,6 +91,19 @@ class Neo4jWriter:
                 desc = hook.description or hook.cypher[:60]
                 logger.info("Running hook: %s", desc)
                 session.run(hook.cypher)
+
+    # -- Schema enforcement --------------------------------------------------
+
+    def apply_schema(self, schema: SchemaDefinition) -> None:
+        """Generate and execute Cypher for constraints and indexes."""
+        hooks = schema.to_hooks()
+        if hooks:
+            logger.info(
+                "Applying schema: %d constraints, %d indexes",
+                len(schema.constraints),
+                len(schema.indexes),
+            )
+            self.run_hooks(hooks)
 
     # -- Node writing --------------------------------------------------------
 

@@ -1,0 +1,9 @@
+source_entity,field_cardinality,source_column,data_type,is_key,transform,target_entity,target_column,relationship_type,rel_source_key,rel_target_key
+employees,1:1,emp_id,int,true,,Person,emp_id,,,
+employees,1:1,full_name,string,false,strip,Person,name,,,
+employees,1:1,email,string,false,lowercase,Person,email,,,
+employees,1:1,title,string,false,strip,Person,title,,,
+employees,1:M,dept_id,int,false,,Department,dept_id,WORKS_IN,emp_id,dept_id
+departments,1:1,dept_id,int,true,,Department,dept_id,,,
+departments,1:1,dept_name,string,false,strip,Department,name,,,
+departments,1:1,location,string,false,,Department,location,,,

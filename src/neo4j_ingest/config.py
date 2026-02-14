@@ -194,6 +194,108 @@ class SchemaHook(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Declarative Neo4j schema (constraints and indexes)
+# ---------------------------------------------------------------------------
+
+class SchemaConstraint(BaseModel):
+    """A Neo4j constraint definition.
+
+    Supported types: unique, exists, node_key.
+    """
+
+    label: str
+    property: str | list[str]  # single property or composite
+    type: Literal["unique", "exists", "node_key"] = "unique"
+    name: str | None = None  # optional constraint name
+
+    def to_cypher(self) -> str:
+        """Generate the CREATE CONSTRAINT Cypher statement."""
+        props = self.property if isinstance(self.property, list) else [self.property]
+        constraint_name = self.name or f"{self.label.lower()}_{'_'.join(props)}_{self.type}"
+
+        if self.type == "unique":
+            prop_clause = ", ".join(f"n.{p}" for p in props)
+            return (
+                f"CREATE CONSTRAINT {constraint_name} IF NOT EXISTS "
+                f"FOR (n:{self.label}) REQUIRE ({prop_clause}) IS UNIQUE"
+            )
+        elif self.type == "exists":
+            # Existence constraints apply to a single property
+            return (
+                f"CREATE CONSTRAINT {constraint_name} IF NOT EXISTS "
+                f"FOR (n:{self.label}) REQUIRE n.{props[0]} IS NOT NULL"
+            )
+        elif self.type == "node_key":
+            prop_clause = ", ".join(f"n.{p}" for p in props)
+            return (
+                f"CREATE CONSTRAINT {constraint_name} IF NOT EXISTS "
+                f"FOR (n:{self.label}) REQUIRE ({prop_clause}) IS NODE KEY"
+            )
+        else:
+            raise ValueError(f"Unknown constraint type: {self.type}")
+
+
+class SchemaIndex(BaseModel):
+    """A Neo4j index definition.
+
+    Supported types: btree, text, range, point, fulltext.
+    """
+
+    label: str
+    properties: list[str]
+    type: Literal["btree", "text", "range", "point", "fulltext"] = "range"
+    name: str | None = None  # optional index name
+
+    def to_cypher(self) -> str:
+        """Generate the CREATE INDEX Cypher statement."""
+        index_name = self.name or f"idx_{self.label.lower()}_{'_'.join(self.properties)}"
+        prop_clause = ", ".join(f"n.{p}" for p in self.properties)
+
+        if self.type == "fulltext":
+            # Fulltext indexes use a different syntax
+            return (
+                f"CREATE FULLTEXT INDEX {index_name} IF NOT EXISTS "
+                f"FOR (n:{self.label}) ON EACH [{prop_clause}]"
+            )
+        else:
+            type_prefix = self.type.upper() + " " if self.type != "btree" else ""
+            return (
+                f"CREATE {type_prefix}INDEX {index_name} IF NOT EXISTS "
+                f"FOR (n:{self.label}) ON ({prop_clause})"
+            )
+
+
+class SchemaDefinition(BaseModel):
+    """Declarative Neo4j schema: constraints and indexes.
+
+    The framework generates and executes the corresponding Cypher
+    statements as pre-hooks before data ingestion.
+    """
+
+    constraints: list[SchemaConstraint] = Field(default_factory=list)
+    indexes: list[SchemaIndex] = Field(default_factory=list)
+
+    def to_hooks(self) -> list["SchemaHook"]:
+        """Convert the schema definition into executable SchemaHook objects."""
+        hooks: list[SchemaHook] = []
+        for constraint in self.constraints:
+            hooks.append(
+                SchemaHook(
+                    cypher=constraint.to_cypher(),
+                    description=f"{constraint.type} constraint on {constraint.label}.{constraint.property}",
+                )
+            )
+        for index in self.indexes:
+            hooks.append(
+                SchemaHook(
+                    cypher=index.to_cypher(),
+                    description=f"{index.type} index on {index.label}.{index.properties}",
+                )
+            )
+        return hooks
+
+
+# ---------------------------------------------------------------------------
 # Job-level settings
 # ---------------------------------------------------------------------------
 
@@ -229,11 +331,14 @@ class JobSettings(BaseModel):
 class IngestConfig(BaseModel):
     """Top-level configuration for an ingestion job."""
 
+    model_config = {"populate_by_name": True}
+
     neo4j: Neo4jConnection = Field(default_factory=Neo4jConnection)
     settings: JobSettings = Field(default_factory=JobSettings)
     sources: list[SourceConfig]
     nodes: list[NodeMapping]
     relationships: list[RelationshipMapping] = Field(default_factory=list)
+    graph_schema: SchemaDefinition | None = Field(default=None, alias="schema")
     pre_hooks: list[SchemaHook] = Field(default_factory=list)
     post_hooks: list[SchemaHook] = Field(default_factory=list)
 
@@ -258,8 +363,15 @@ class IngestConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 def load_config(path: str | Path) -> IngestConfig:
-    """Load, resolve env vars, and validate a config file (YAML or JSON)."""
+    """Load, resolve env vars, and validate a config file (YAML, JSON, or CSV mapping)."""
     path = Path(path)
+
+    # CSV mapping files get routed to the CSV mapping loader
+    if path.suffix == ".csv":
+        from neo4j_ingest.csv_mapping import load_csv_mapping
+
+        return load_csv_mapping(path)
+
     text = path.read_text()
 
     if path.suffix in (".yaml", ".yml"):

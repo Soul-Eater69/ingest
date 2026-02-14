@@ -153,6 +153,15 @@ def _run_spark(
         batch_size=spark_settings.neo4j_connector_batch_size,
         partitions=spark_settings.partitions,
     ) as writer:
+        # Schema enforcement (before pre-hooks)
+        if config.graph_schema:
+            schema_step = job_metrics.add_step("schema")
+            with track_step(schema_step):
+                writer.apply_schema(config.graph_schema)
+                schema_step.records_processed = (
+                    len(config.graph_schema.constraints) + len(config.graph_schema.indexes)
+                )
+
         # Pre-hooks
         if config.pre_hooks:
             hook_step = job_metrics.add_step("pre_hooks")
@@ -281,6 +290,15 @@ def _run_standard(
         retry_max_attempts=settings.retry_max_attempts,
         retry_base_delay=settings.retry_base_delay,
     ) as writer:
+        # Schema enforcement (before pre-hooks)
+        if config.graph_schema:
+            schema_step = job_metrics.add_step("schema")
+            with track_step(schema_step):
+                writer.apply_schema(config.graph_schema)
+                schema_step.records_processed = (
+                    len(config.graph_schema.constraints) + len(config.graph_schema.indexes)
+                )
+
         # Pre-hooks
         if config.pre_hooks:
             hook_step = job_metrics.add_step("pre_hooks")

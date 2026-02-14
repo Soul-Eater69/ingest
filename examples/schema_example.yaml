@@ -1,0 +1,82 @@
+# Schema Example: Declarative Neo4j schema with constraints and indexes.
+#
+# Instead of writing raw Cypher in pre_hooks, define your schema
+# declaratively and let the framework generate the Cypher for you.
+
+neo4j:
+  uri: ${NEO4J_URI:-bolt://localhost:7687}
+  username: ${NEO4J_USER:-neo4j}
+  password: ${NEO4J_PASSWORD:-changeme}
+  database: ${NEO4J_DATABASE:-neo4j}
+
+settings:
+  batch_size: 1000
+  health_check: true
+
+# Declarative schema — auto-generates constraint/index Cypher
+schema:
+  constraints:
+    - label: Person
+      property: emp_id
+      type: unique
+    - label: Department
+      property: dept_id
+      type: unique
+    - label: Person
+      property: email
+      type: exists
+  indexes:
+    - label: Person
+      properties: [email]
+      type: range
+    - label: Person
+      properties: [name]
+      type: text
+    - label: Department
+      properties: [name, location]
+      type: range
+
+sources:
+  - name: employees
+    type: csv
+    path: examples/data/employees.csv
+
+  - name: departments
+    type: csv
+    path: examples/data/departments.csv
+
+nodes:
+  - source: employees
+    label: Person
+    key: emp_id
+    properties:
+      - source_field: emp_id
+        transform:
+          type: to_int
+      - source_field: name
+        transform:
+          type: strip
+      - source_field: email
+        transform:
+          type: lowercase
+
+  - source: departments
+    label: Department
+    key: dept_id
+    properties:
+      - source_field: dept_id
+        transform:
+          type: to_int
+      - source_field: dept_name
+        target: name
+      - source_field: location
+
+relationships:
+  - source: employees
+    rel_type: WORKS_IN
+    from_label: Person
+    from_key: emp_id
+    from_field: emp_id
+    to_label: Department
+    to_key: dept_id
+    to_field: dept_id
