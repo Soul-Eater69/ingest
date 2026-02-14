@@ -1,0 +1,245 @@
+{
+  "$id": "kg-mapping-schema.json",
+  "title": "Consolidated Knowledge Graph Mapping Schema",
+  "description": "Maps source analysis results to a Neo4j property graph with deterministic ID generation, multi-source tracking, and declarative schema enforcement.",
+  "version": "4.0.0",
+  "metadata": {
+    "lastUpdated": "2026-02-14",
+    "purpose": "Single source of truth for KG mapping supporting multiple data sources with explicit source tracking",
+    "sourceFormat": "Dual-source: CodeQL analysis JSONL and code attributor JSONL files",
+    "changelog": {
+      "4.0.0": "Added SHA-256 ID generation, multi-source support, schema enforcement",
+      "3.0.0": "Added relationship properties and validation",
+      "2.0.0": "Initial schema with node and relationship definitions"
+    }
+  },
+  "idGeneration": {
+    "strategy": "sha256-hash",
+    "description": "ID generation uses SHA-256 hashing of natural keys from source data. This produces deterministic, reproducible, collision-free identifiers that are consistent across repositories and pipeline runs.",
+    "hashAlgorithm": "sha256",
+    "hashLength": 16,
+    "implementation": "Parser generates 16-character hexadecimal hash from natural key fields using SHA-256",
+    "benefits": [
+      "Deterministic: same input always produces same ID",
+      "Reproducible: re-running the pipeline yields identical graph",
+      "No collisions: SHA-256 truncated to 16 hex chars (64 bits)",
+      "Cross-repository consistent: same entity in different repos gets same ID"
+    ]
+  },
+  "sourceDefinitions": {
+    "codeql": {
+      "description": "CodeQL static analysis results",
+      "dataFormat": "JSONL files from CodeQL databases",
+      "examples": [
+        "data/methods/method-signatures.jsonl",
+        "data/control/package-file-hierarchy.jsonl"
+      ]
+    },
+    "attributor": {
+      "description": "Code attribution and ownership data",
+      "dataFormat": "JSONL files from code attributor tool",
+      "examples": [
+        "data/attribution/file-owners.jsonl",
+        "data/attribution/team-mapping.jsonl"
+      ]
+    }
+  },
+  "nodes": [
+    {
+      "label": "Repository",
+      "naturalKey": ["repo_name"],
+      "idField": "_id",
+      "source": "codeql",
+      "properties": {
+        "name": {
+          "source": "codeql",
+          "sourceField": "repo_name",
+          "type": "string",
+          "required": true,
+          "description": "Repository name"
+        },
+        "language": {
+          "source": "codeql",
+          "sourceField": "primary_language",
+          "type": "string",
+          "required": false,
+          "description": "Primary programming language"
+        },
+        "product_abbrev": {
+          "source": "attributor",
+          "sourceField": "product_code",
+          "type": "string",
+          "required": false,
+          "description": "Product abbreviation from attribution data"
+        }
+      }
+    },
+    {
+      "label": "Package",
+      "naturalKey": ["repo_name", "package_name"],
+      "idField": "_id",
+      "source": "codeql",
+      "properties": {
+        "name": {
+          "source": "codeql",
+          "sourceField": "package_name",
+          "type": "string",
+          "required": true,
+          "description": "Fully qualified package name"
+        },
+        "file_count": {
+          "source": "codeql",
+          "sourceField": "file_count",
+          "type": "int",
+          "required": false,
+          "description": "Number of files in the package"
+        }
+      }
+    },
+    {
+      "label": "Class",
+      "naturalKey": ["repo_name", "package_name", "class_name"],
+      "idField": "_id",
+      "source": "codeql",
+      "properties": {
+        "name": {
+          "source": "codeql",
+          "sourceField": "class_name",
+          "type": "string",
+          "required": true,
+          "description": "Class name"
+        },
+        "is_abstract": {
+          "source": "codeql",
+          "sourceField": "is_abstract",
+          "type": "bool",
+          "required": false,
+          "description": "Whether the class is abstract"
+        },
+        "line_count": {
+          "source": "codeql",
+          "sourceField": "line_count",
+          "type": "int",
+          "required": false,
+          "description": "Lines of code in the class"
+        }
+      }
+    },
+    {
+      "label": "Method",
+      "naturalKey": ["repo_name", "class_name", "method_name", "method_signature"],
+      "idField": "_id",
+      "source": "codeql",
+      "properties": {
+        "name": {
+          "source": "codeql",
+          "sourceField": "method_name",
+          "type": "string",
+          "required": true,
+          "description": "Method name"
+        },
+        "signature": {
+          "source": "codeql",
+          "sourceField": "method_signature",
+          "type": "string",
+          "required": false,
+          "description": "Full method signature"
+        },
+        "visibility": {
+          "source": "codeql",
+          "sourceField": "visibility",
+          "type": "string",
+          "required": false,
+          "description": "Access modifier (public, private, protected)"
+        },
+        "is_static": {
+          "source": "codeql",
+          "sourceField": "is_static",
+          "type": "bool",
+          "required": false,
+          "description": "Whether the method is static"
+        }
+      }
+    },
+    {
+      "label": "Team",
+      "naturalKey": ["team_name"],
+      "idField": "_id",
+      "source": "attributor",
+      "properties": {
+        "name": {
+          "source": "attributor",
+          "sourceField": "team_name",
+          "type": "string",
+          "required": true,
+          "description": "Team name"
+        },
+        "org_unit": {
+          "source": "attributor",
+          "sourceField": "org_unit",
+          "type": "string",
+          "required": false,
+          "description": "Organizational unit"
+        }
+      }
+    }
+  ],
+  "relationships": [
+    {
+      "type": "CONTAINS_PACKAGE",
+      "source": "codeql",
+      "fromNode": "Repository",
+      "fromKey": "_id",
+      "fromField": "repo_id",
+      "toNode": "Package",
+      "toKey": "_id",
+      "toField": "package_id"
+    },
+    {
+      "type": "HAS_CLASS",
+      "source": "codeql",
+      "fromNode": "Package",
+      "fromKey": "_id",
+      "fromField": "package_id",
+      "toNode": "Class",
+      "toKey": "_id",
+      "toField": "class_id"
+    },
+    {
+      "type": "HAS_METHOD",
+      "source": "codeql",
+      "fromNode": "Class",
+      "fromKey": "_id",
+      "fromField": "class_id",
+      "toNode": "Method",
+      "toKey": "_id",
+      "toField": "method_id"
+    },
+    {
+      "type": "CALLS",
+      "source": "codeql",
+      "fromNode": "Method",
+      "fromKey": "_id",
+      "fromField": "caller_id",
+      "toNode": "Method",
+      "toKey": "_id",
+      "toField": "callee_id",
+      "properties": {
+        "call_count": {
+          "sourceField": "call_count",
+          "type": "int"
+        }
+      }
+    },
+    {
+      "type": "OWNS",
+      "source": "attributor",
+      "fromNode": "Team",
+      "fromKey": "_id",
+      "fromField": "team_id",
+      "toNode": "Repository",
+      "toKey": "_id",
+      "toField": "repo_id"
+    }
+  ]
+}

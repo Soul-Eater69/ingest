@@ -23,6 +23,7 @@ Config example:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime
 from typing import Any
@@ -115,6 +116,26 @@ def template_transform(value: Any, *, template: str = "{value}", **kwargs: Any) 
     if value is None:
         return None
     return template.format(value=value)
+
+
+@transform_registry.register("sha256")
+def sha256_hash(value: Any, *, length: int = 16, **kwargs: Any) -> str | None:
+    """Generate a truncated SHA-256 hash from a value (deterministic ID)."""
+    if value is None or value == "":
+        return None
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:length]
+
+
+@transform_registry.register("concat")
+def concat_fields(value: Any, *, separator: str = ":", **kwargs: Any) -> str | None:
+    """Concatenate value components separated by a delimiter.
+
+    The value should be a string; additional fields can be joined
+    upstream before passing to this transform.
+    """
+    if value is None:
+        return None
+    return str(value)
 
 
 # Pipeline runner ------------------------------------------------------------

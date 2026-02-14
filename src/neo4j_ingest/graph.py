@@ -26,6 +26,7 @@ from neo4j_ingest.config import (
     SchemaHook,
     TransformConfig,
 )
+from neo4j_ingest.id_generation import IdGenerationConfig
 from neo4j_ingest.metrics import ProgressReporter
 from neo4j_ingest.resilience import retry
 from neo4j_ingest.transforms import apply_transforms
@@ -136,6 +137,12 @@ class Neo4jWriter:
                 mapping.key,
             )
             row[mapping.key] = record.get(key_field)
+
+        # ID generation: compute a deterministic ID from natural key fields
+        if mapping.id_generation:
+            id_gen = IdGenerationConfig(**mapping.id_generation.model_dump())
+            row[mapping.key] = id_gen.generate_id(record)
+
         return row
 
     def _run_batch(self, query: str, batch: list[Record]) -> None:

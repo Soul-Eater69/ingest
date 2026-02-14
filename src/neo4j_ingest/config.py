@@ -154,6 +154,20 @@ class PropertyMapping(BaseModel):
         return self.target or self.source_field
 
 
+class IdGenerationConfig(BaseModel):
+    """Configuration for deterministic ID generation on a node mapping.
+
+    When present, the framework generates an ID for each record using the
+    specified strategy and injects it as the merge key before writing.
+    """
+
+    strategy: Literal["sha256-hash", "composite", "passthrough"] = "sha256-hash"
+    fields: list[str] = Field(default_factory=list)
+    hash_length: int = 16
+    separator: str = ":"
+    prefix: str = ""
+
+
 class NodeMapping(BaseModel):
     """Defines how source records become Neo4j nodes."""
 
@@ -161,6 +175,7 @@ class NodeMapping(BaseModel):
     label: str
     key: str
     properties: list[PropertyMapping]
+    id_generation: IdGenerationConfig | None = None
     validation: ValidationConfig | None = None
 
 
@@ -363,7 +378,14 @@ class IngestConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 def load_config(path: str | Path) -> IngestConfig:
-    """Load, resolve env vars, and validate a config file (YAML, JSON, or CSV mapping)."""
+    """Load, resolve env vars, and validate a config file.
+
+    Supports:
+    - YAML / JSON  → standard IngestConfig
+    - CSV          → CSV mapping loader
+    - JSON with KG markers (``$id``, ``idGeneration``, ``sourceDefinitions``,
+      or dict-style ``properties`` in nodes) → KG mapping schema loader
+    """
     path = Path(path)
 
     # CSV mapping files get routed to the CSV mapping loader
@@ -383,6 +405,16 @@ def load_config(path: str | Path) -> IngestConfig:
             raw = yaml.safe_load(text)
         except yaml.YAMLError:
             raw = json.loads(text)
+
+    # Detect KG mapping schema (JSON with $id, idGeneration, sourceDefinitions,
+    # or dict-style properties inside node defs)
+    if isinstance(raw, dict):
+        from neo4j_ingest.kg_schema import is_kg_mapping_schema
+
+        if is_kg_mapping_schema(raw):
+            from neo4j_ingest.kg_schema import load_kg_schema_from_dict
+
+            return load_kg_schema_from_dict(raw)
 
     # Resolve ${ENV_VAR} and ${ENV_VAR:-default} patterns
     raw = resolve_env_vars(raw)

@@ -94,7 +94,12 @@ def run(config: str, log_level: str, metrics_output: str | None, mapping_csv: st
     show_default=True,
 )
 def validate(config: str, log_level: str) -> None:
-    """Validate a config file without running the pipeline."""
+    """Validate a config file without running the pipeline.
+
+    Supports YAML, JSON, CSV mapping files, and KG mapping schemas.
+    KG mapping schemas are auto-detected from JSON files containing
+    markers like $id, idGeneration, or sourceDefinitions.
+    """
     _setup_logging(log_level)
 
     from neo4j_ingest.engine import validate_config
@@ -109,6 +114,13 @@ def validate(config: str, log_level: str) -> None:
     click.echo(f"  Sources:       {len(cfg.sources)}")
     click.echo(f"  Node mappings: {len(cfg.nodes)}")
     click.echo(f"  Rel mappings:  {len(cfg.relationships)}")
+    if cfg.graph_schema:
+        click.echo(f"  Schema constraints: {len(cfg.graph_schema.constraints)}")
+        click.echo(f"  Schema indexes:     {len(cfg.graph_schema.indexes)}")
+    # Count nodes with ID generation
+    id_gen_count = sum(1 for n in cfg.nodes if n.id_generation)
+    if id_gen_count:
+        click.echo(f"  ID generation: {id_gen_count} node(s)")
     click.echo(f"  Pre-hooks:     {len(cfg.pre_hooks)}")
     click.echo(f"  Post-hooks:    {len(cfg.post_hooks)}")
 
