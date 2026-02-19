@@ -1,0 +1,91 @@
+# =============================================================================
+# Codebase Indexer – Docker Compose
+# =============================================================================
+#
+# Profiles:
+#   default    API server + ChromaDB (local embedded)
+#   qdrant     API server + external Qdrant vector database
+#
+# Usage:
+#   docker compose up                   # start with ChromaDB
+#   docker compose --profile qdrant up  # start with Qdrant
+#   docker compose run --rm api cidx index /repo  # run CLI indexing
+
+version: "3.9"
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # API Server
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: src/codebase_indexer/Dockerfile
+    image: codebase-indexer:latest
+    container_name: cidx-api
+    restart: unless-stopped
+    ports:
+      - "${CIDX_API_PORT:-8000}:8000"
+    volumes:
+      # Read-only access to the codebase you want to index
+      # Override CIDX_REPO_PATH in .env to change
+      - "${CIDX_REPO_PATH:-/tmp/repo}:/repo:ro"
+      # Persistent data volumes
+      - cidx-chroma:/app/.cidx_data/chroma
+      - cidx-metadata:/app/.cidx_data
+      - cidx-bm25:/app/.cidx_data
+      - cidx-embed-cache:/app/.cidx_cache
+    env_file:
+      - .env
+    environment:
+      # Override defaults for container networking
+      - CIDX_CHROMA_PATH=/app/.cidx_data/chroma
+      - CIDX_METADATA_DB_URL=sqlite:////app/.cidx_data/metadata.db
+      - CIDX_BM25_INDEX_PATH=/app/.cidx_data/bm25.pkl
+      - CIDX_EMBED_CACHE_DIR=/app/.cidx_cache/embeddings
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      qdrant:
+        condition: service_healthy
+        required: false
+
+  # ---------------------------------------------------------------------------
+  # Qdrant Vector Database (optional – activate with --profile qdrant)
+  # ---------------------------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:v1.7.4
+    container_name: cidx-qdrant
+    profiles: ["qdrant"]
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant-storage:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  cidx-chroma:
+    driver: local
+  cidx-metadata:
+    driver: local
+  cidx-bm25:
+    driver: local
+  cidx-embed-cache:
+    driver: local
+  qdrant-storage:
+    driver: local
